@@ -39,6 +39,28 @@ class DNSRecordType {
         ];
         return $map[$type] ?? 'UNKNOWN';
     }
+    
+    public static function getTypeFromName(string $name): ?int {
+        $map = [
+            'A' => self::A,
+            'NS' => self::NS,
+            'CNAME' => self::CNAME,
+            'SOA' => self::SOA,
+            'PTR' => self::PTR,
+            'MX' => self::MX,
+            'TXT' => self::TXT,
+            'AAAA' => self::AAAA,
+            'SRV' => self::SRV,
+            'DNAME' => self::DNAME,
+            'DS' => self::DS,
+            'RRSIG' => self::RRSIG,
+            'NSEC' => self::NSEC,
+            'DNSKEY' => self::DNSKEY,
+            'HTTPS' => self::HTTPS,
+            'ANY' => self::ANY
+        ];
+        return $map[strtoupper($name)] ?? null;
+    }
 }
 
 class DNSRecord {
@@ -89,18 +111,24 @@ class DNSRecord {
                 return sprintf("%s\t%d\t%d\t%s", $typeStr, $ttlDisplay, $this->preference, $this->data);
             case DNSRecordType::SOA:
                 $soa = $this->data;
-                return sprintf("%s\t%d\t%s %s (%d %d %d %d %d)", 
-                    $typeStr, $ttlDisplay, 
-                    $soa['mname'], $soa['rname'],
-                    $soa['serial'], $soa['refresh'], $soa['retry'],
-                    $soa['expire'], $soa['minimum']);
+                if (is_array($soa)) {
+                    return sprintf("%s\t%d\t%s %s (%d %d %d %d %d)", 
+                        $typeStr, $ttlDisplay, 
+                        $soa['mname'], $soa['rname'],
+                        $soa['serial'], $soa['refresh'], $soa['retry'],
+                        $soa['expire'], $soa['minimum']);
+                }
+                return sprintf("%s\t%d\t%s", $typeStr, $ttlDisplay, $this->data);
             case DNSRecordType::TXT:
                 return sprintf("%s\t%d\t\"%s\"", $typeStr, $ttlDisplay, $this->data);
             case DNSRecordType::SRV:
                 $srv = $this->data;
-                return sprintf("%s\t%d\t%d %d %d %s", 
-                    $typeStr, $ttlDisplay,
-                    $srv['priority'], $srv['weight'], $srv['port'], $srv['target']);
+                if (is_array($srv)) {
+                    return sprintf("%s\t%d\t%d %d %d %s", 
+                        $typeStr, $ttlDisplay,
+                        $srv['priority'], $srv['weight'], $srv['port'], $srv['target']);
+                }
+                return sprintf("%s\t%d\t%s", $typeStr, $ttlDisplay, $this->data);
             default:
                 return sprintf("%s\t%d\t%s", $typeStr, $ttlDisplay, $this->data);
         }
@@ -121,10 +149,18 @@ class DNSRecord {
                 $result['exchange'] = $this->data;
                 break;
             case DNSRecordType::SOA:
-                $result = array_merge($result, $this->data);
+                if (is_array($this->data)) {
+                    $result = array_merge($result, $this->data);
+                } else {
+                    $result['data'] = $this->data;
+                }
                 break;
             case DNSRecordType::SRV:
-                $result = array_merge($result, $this->data);
+                if (is_array($this->data)) {
+                    $result = array_merge($result, $this->data);
+                } else {
+                    $result['data'] = $this->data;
+                }
                 break;
             default:
                 $result['data'] = $this->data;
@@ -156,6 +192,9 @@ class DNSCache {
         $currentTime = microtime(true);
 
         foreach ($records as $record) {
+            if (!($record instanceof DNSRecord)) {
+                continue;
+            }
             $elapsed = $currentTime - $timestamp;
             if ($record->ttl > $elapsed) {
                 $remainingTTL = $record->ttl - (int)$elapsed;
@@ -175,6 +214,7 @@ class DNSCache {
 
         if (!empty($validRecords)) {
             $this->cache[$key]['access_time'] = microtime(true);
+            $this->cache[$key]['hits'] = ($this->cache[$key]['hits'] ?? 0) + 1;
             return $validRecords;
         } else {
             unset($this->cache[$key]);
@@ -186,15 +226,16 @@ class DNSCache {
     public function put(string $key, array $records): void {
         if (isset($this->cache[$key])) {
             unset($this->cache[$key]);
-        } else {
-            $this->size++;
+            $this->size--;
         }
 
         $this->cache[$key] = [
             'timestamp' => microtime(true),
             'access_time' => microtime(true),
-            'records' => $records
+            'records' => $records,
+            'hits' => 0
         ];
+        $this->size++;
 
         if ($this->size > $this->maxSize) {
             $this->evictOldest();
@@ -226,6 +267,27 @@ class DNSCache {
     public function size(): int {
         return $this->size;
     }
+
+    public function getStats(): array {
+        $stats = [
+            'size' => $this->size,
+            'max_size' => $this->maxSize,
+            'hits' => 0,
+            'entries' => []
+        ];
+        
+        foreach ($this->cache as $key => $entry) {
+            $stats['hits'] += $entry['hits'] ?? 0;
+            $stats['entries'][] = [
+                'key' => $key,
+                'hits' => $entry['hits'] ?? 0,
+                'age' => microtime(true) - $entry['timestamp'],
+                'record_count' => count($entry['records'])
+            ];
+        }
+        
+        return $stats;
+    }
 }
 
 class DNSResolver {
@@ -239,6 +301,8 @@ class DNSResolver {
     const MAX_CNAME_REDIRECTS = 15;
     const DEFAULT_TIMEOUT = 3;
     const DEFAULT_RETRIES = 3;
+    const MAX_RESPONSE_SIZE = 65535;
+    const MAX_RECORDS_PER_RESPONSE = 1000;
 
     private array $dnsServers;
     private int $timeout;
@@ -248,6 +312,7 @@ class DNSResolver {
     private bool $enableCache;
     private DNSCache $cache;
     private array $queryStats = [];
+    private bool $debug;
 
     public function __construct(
         array $dnsServers = null,
@@ -256,7 +321,8 @@ class DNSResolver {
         bool $useTcp = false,
         bool $requestDnssec = false,
         bool $enableCache = true,
-        int $maxCacheSize = 1024
+        int $maxCacheSize = 1024,
+        bool $debug = false
     ) {
         $this->dnsServers = $dnsServers ?? self::DEFAULT_DNS_SERVERS;
         $this->timeout = $timeout;
@@ -264,11 +330,16 @@ class DNSResolver {
         $this->useTcp = $useTcp;
         $this->requestDnssec = $requestDnssec;
         $this->enableCache = $enableCache;
+        $this->debug = $debug;
         $this->cache = new DNSCache($maxCacheSize);
         $this->validateDnsServers();
     }
 
     private function validateDnsServers(): void {
+        if (empty($this->dnsServers)) {
+            throw new InvalidArgumentException("No DNS servers provided");
+        }
+        
         foreach ($this->dnsServers as $server) {
             if (!is_array($server) || count($server) !== 2) {
                 throw new InvalidArgumentException("Invalid DNS server format");
@@ -298,8 +369,22 @@ class DNSResolver {
             return false;
         }
         
-        if (!preg_match('/^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i', $domain)) {
+        if (strlen($domain) < 1) {
             return false;
+        }
+        
+        $labels = explode('.', $domain);
+        if (count($labels) > 127) {
+            return false;
+        }
+        
+        foreach ($labels as $label) {
+            if (strlen($label) > 63) {
+                return false;
+            }
+            if (!preg_match('/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i', $label)) {
+                return false;
+            }
         }
         
         return true;
@@ -312,9 +397,12 @@ class DNSResolver {
 
         $tid = random_int(0, 65535);
         $flags = 0x0100;
-        $sourcePort = random_int(1024, 65535);
+        
+        if ($dnssec) {
+            $flags |= 0x100;
+        }
 
-        $header = pack('n6', $tid, $flags, 1, 0, 0, 1);
+        $header = pack('n6', $tid, $flags, 1, 0, 0, 0);
 
         if ($domain === '.') {
             $qname = "\x00";
@@ -329,15 +417,19 @@ class DNSResolver {
 
         $question = $qname . pack('n2', $queryType, 1);
 
-        $udpPayload = 4096;
-        $ednsFlags = $dnssec ? 0x80000000 : 0;
-        $edns = "\x00" . pack('nnNn', 41, $udpPayload, $ednsFlags, 0);
+        if ($dnssec) {
+            $ednsHeader = pack('n2', 41, self::MAX_UDP_SIZE);
+            $ednsFlags = 0x8000;
+            $edns = "\x00" . $ednsHeader . pack('nN', $ednsFlags, 0);
+            $question .= $edns;
+        }
 
-        return [$header . $question . $edns, $tid, $sourcePort];
+        return [$header . $question, $tid];
     }
 
     private function parseName(string $data, int $offset, array &$seenPointers = []): array {
-        if ($offset >= strlen($data)) {
+        $maxLength = strlen($data);
+        if ($offset >= $maxLength) {
             throw new RuntimeException("Offset beyond packet length");
         }
 
@@ -348,27 +440,32 @@ class DNSResolver {
         $jumpCount = 0;
 
         while (true) {
+            if ($jumpCount > $maxJumps) {
+                throw new RuntimeException("Too many DNS pointer jumps");
+            }
+            
             if (in_array($offset, $seenPointers)) {
                 throw new RuntimeException("DNS compression loop detected");
             }
             $seenPointers[] = $offset;
 
-            if ($offset >= strlen($data)) {
+            if ($offset >= $maxLength) {
                 throw new RuntimeException("DNS packet parsing overflow");
             }
 
             $length = ord($data[$offset]);
+            
             if ($length === 0) {
                 $offset++;
                 break;
             }
             
             if (($length & 0xC0) === 0xC0) {
-                if ($offset + 1 >= strlen($data)) {
+                if ($offset + 1 >= $maxLength) {
                     throw new RuntimeException("Invalid DNS pointer offset");
                 }
                 $pointer = unpack('n', substr($data, $offset, 2))[1] & 0x3FFF;
-                if ($pointer >= strlen($data)) {
+                if ($pointer >= $maxLength) {
                     throw new RuntimeException("DNS pointer out of bounds");
                 }
                 if (!$jumped) {
@@ -377,19 +474,21 @@ class DNSResolver {
                 $offset = $pointer;
                 $jumped = true;
                 $jumpCount++;
-                if ($jumpCount >= $maxJumps) {
-                    throw new RuntimeException("Too many DNS pointer jumps");
-                }
                 continue;
-            } else {
-                $offset++;
-                if ($offset + $length > strlen($data)) {
-                    throw new RuntimeException("DNS label length exceeds packet size");
-                }
-                $label = substr($data, $offset, $length);
-                $labels[] = $label;
-                $offset += $length;
             }
+            
+            if ($length > 63) {
+                throw new RuntimeException("Invalid label length: $length");
+            }
+            
+            $offset++;
+            if ($offset + $length > $maxLength) {
+                throw new RuntimeException("DNS label length exceeds packet size");
+            }
+            
+            $label = substr($data, $offset, $length);
+            $labels[] = $label;
+            $offset += $length;
         }
 
         return [implode('.', $labels), $jumped ? $originalOffset : $offset];
@@ -400,13 +499,13 @@ class DNSResolver {
             switch ($rtype) {
                 case DNSRecordType::A:
                     if (strlen($rdata) !== 4) {
-                        return bin2hex($rdata);
+                        throw new RuntimeException("Invalid A record length: " . strlen($rdata));
                     }
                     return inet_ntop($rdata);
                     
                 case DNSRecordType::AAAA:
                     if (strlen($rdata) !== 16) {
-                        return bin2hex($rdata);
+                        throw new RuntimeException("Invalid AAAA record length: " . strlen($rdata));
                     }
                     return inet_ntop($rdata);
                     
@@ -423,6 +522,9 @@ class DNSResolver {
                         throw new RuntimeException("SRV record too short");
                     }
                     $unpacked = unpack('npriority/nweight/nport', substr($rdata, 0, 6));
+                    if ($unpacked === false) {
+                        throw new RuntimeException("Failed to unpack SRV record");
+                    }
                     [$target] = $this->parseName($packet, $rdataStart + 6);
                     return [
                         'priority' => $unpacked['priority'],
@@ -443,10 +545,14 @@ class DNSResolver {
                     $pos = 0;
                     $len = strlen($rdata);
                     while ($pos < $len) {
-                        if ($pos + 1 > $len) break;
+                        if ($pos + 1 > $len) {
+                            break;
+                        }
                         $txtLen = ord($rdata[$pos]);
                         $pos++;
-                        if ($pos + $txtLen > $len) break;
+                        if ($pos + $txtLen > $len) {
+                            break;
+                        }
                         $parts[] = substr($rdata, $pos, $txtLen);
                         $pos += $txtLen;
                     }
@@ -460,6 +566,9 @@ class DNSResolver {
                         throw new RuntimeException("SOA numeric fields truncated");
                     }
                     $items = unpack('N5', substr($packet, $offset, 20));
+                    if ($items === false) {
+                        throw new RuntimeException("Failed to unpack SOA record");
+                    }
                     return [
                         'mname' => $mname,
                         'rname' => $rname,
@@ -474,7 +583,9 @@ class DNSResolver {
                     return bin2hex($rdata);
             }
         } catch (Exception $e) {
-            error_log("Failed to parse record type {$rtype}: " . $e->getMessage());
+            if ($this->debug) {
+                error_log("Failed to parse record type {$rtype}: " . $e->getMessage());
+            }
             return bin2hex($rdata);
         }
     }
@@ -484,7 +595,14 @@ class DNSResolver {
             throw new RuntimeException("DNS response too short");
         }
 
+        if (strlen($data) > self::MAX_RESPONSE_SIZE) {
+            throw new RuntimeException("DNS response too large");
+        }
+
         $header = unpack('ntid/nflags/nqdcount/nancount/nnscount/narcount', substr($data, 0, 12));
+        if ($header === false) {
+            throw new RuntimeException("Failed to unpack DNS header");
+        }
         
         if ($header['tid'] !== $tid) {
             throw new RuntimeException("Transaction ID mismatch");
@@ -495,7 +613,7 @@ class DNSResolver {
         }
 
         $totalRRs = $header['qdcount'] + $header['ancount'] + $header['nscount'] + $header['arcount'];
-        if ($totalRRs > 1000) {
+        if ($totalRRs > self::MAX_RECORDS_PER_RESPONSE) {
             throw new RuntimeException("Excessive RR count: {$totalRRs}");
         }
 
@@ -506,19 +624,19 @@ class DNSResolver {
                 4 => "NOTIMP", 5 => "REFUSED", 6 => "YXDOMAIN", 7 => "YXRRSET",
                 8 => "NXRRSET", 9 => "NOTAUTH", 10 => "NOTZONE"
             ];
-            throw new RuntimeException("DNS error: " . ($errorCodes[$rcode] ?? "RCODE_{$rcode}"));
-        }
-
-        $truncated = ($header['flags'] >> 9) & 0x1;
-        if ($truncated && !$this->useTcp) {
-            error_log("Response truncated (TC=1), consider using TCP");
+            $errorMsg = $errorCodes[$rcode] ?? "RCODE_{$rcode}";
+            throw new RuntimeException("DNS error: " . $errorMsg);
         }
 
         $records = [];
         $offset = 12;
 
         for ($i = 0; $i < $header['qdcount']; $i++) {
-            [, $offset] = $this->parseName($data, $offset);
+            try {
+                [, $offset] = $this->parseName($data, $offset);
+            } catch (Exception $e) {
+                throw new RuntimeException("Failed to parse question name: " . $e->getMessage());
+            }
             if ($offset + 4 > strlen($data)) {
                 throw new RuntimeException("Question section truncated");
             }
@@ -533,11 +651,20 @@ class DNSResolver {
 
         foreach ($sections as $section => $count) {
             for ($i = 0; $i < $count; $i++) {
-                [$name, $offset] = $this->parseName($data, $offset);
+                try {
+                    [$name, $offset] = $this->parseName($data, $offset);
+                } catch (Exception $e) {
+                    throw new RuntimeException("Failed to parse RR name: " . $e->getMessage());
+                }
+                
                 if ($offset + 10 > strlen($data)) {
                     throw new RuntimeException("RR header exceeds packet size");
                 }
+                
                 $rrHeader = unpack('ntype/nclass/Nttl/nrdlength', substr($data, $offset, 10));
+                if ($rrHeader === false) {
+                    throw new RuntimeException("Failed to unpack RR header");
+                }
                 $offset += 10;
                 
                 if ($offset + $rrHeader['rdlength'] > strlen($data)) {
@@ -588,6 +715,9 @@ class DNSResolver {
                         );
                     }
                 } catch (Exception $e) {
+                    if ($this->debug) {
+                        error_log("Failed to create DNSRecord for type {$rrHeader['type']}: " . $e->getMessage());
+                    }
                     $records[] = new DNSRecord(
                         $name,
                         DNSRecordType::ANY,
@@ -611,47 +741,72 @@ class DNSResolver {
         if ($this->useTcp) {
             $socket = @fsockopen("tcp://{$ip}", $port, $errno, $errstr, $this->timeout);
             if (!$socket) {
-                throw new RuntimeException("TCP connection failed: {$errstr}");
+                throw new RuntimeException("TCP connection failed to {$ip}:{$port}: {$errstr} ({$errno})");
             }
             
             stream_set_timeout($socket, $this->timeout);
             $length = pack('n', strlen($query));
-            fwrite($socket, $length . $query);
+            
+            if (fwrite($socket, $length . $query) === false) {
+                fclose($socket);
+                throw new RuntimeException("Failed to write TCP query to {$ip}:{$port}");
+            }
             
             $response = '';
-            while (!feof($socket)) {
-                $response .= fread($socket, 4096);
+            $header = fread($socket, 2);
+            if (strlen($header) !== 2) {
+                fclose($socket);
+                throw new RuntimeException("Invalid TCP response header from {$ip}:{$port}");
+            }
+            
+            $responseLength = unpack('n', $header)[1];
+            if ($responseLength === 0) {
+                fclose($socket);
+                throw new RuntimeException("Zero-length response from {$ip}:{$port}");
+            }
+            
+            $bytesRead = 0;
+            while ($bytesRead < $responseLength && !feof($socket)) {
+                $chunk = fread($socket, min(4096, $responseLength - $bytesRead));
+                if ($chunk === false) {
+                    break;
+                }
+                $response .= $chunk;
+                $bytesRead += strlen($chunk);
             }
             fclose($socket);
             
-            if (strlen($response) < 2) {
-                throw new RuntimeException("Invalid TCP response");
+            if (strlen($response) !== $responseLength) {
+                throw new RuntimeException("Incomplete TCP response from {$ip}:{$port}");
             }
             
-            $responseLength = unpack('n', substr($response, 0, 2))[1];
-            return substr($response, 2, $responseLength);
+            return $response;
         } else {
             $socket = @socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
             if (!$socket) {
                 throw new RuntimeException("UDP socket creation failed");
             }
             
-            socket_set_option($socket, SOL_SOCKET, SO_RCVTIMEO, ['sec' => $this->timeout, 'usec' => 0]);
+            if (!socket_set_option($socket, SOL_SOCKET, SO_RCVTIMEO, ['sec' => $this->timeout, 'usec' => 0])) {
+                socket_close($socket);
+                throw new RuntimeException("Failed to set socket timeout");
+            }
             
             if ($sourcePort) {
                 if (!@socket_bind($socket, '0.0.0.0', $sourcePort)) {
+                    socket_close($socket);
                     error_log("Failed to bind to source port {$sourcePort}");
                 }
             }
             
             if (!@socket_connect($socket, $ip, $port)) {
                 socket_close($socket);
-                throw new RuntimeException("UDP connection failed");
+                throw new RuntimeException("UDP connection failed to {$ip}:{$port}");
             }
             
-            if (!@socket_send($socket, $query, strlen($query), 0)) {
+            if (@socket_send($socket, $query, strlen($query), 0) === false) {
                 socket_close($socket);
-                throw new RuntimeException("UDP send failed");
+                throw new RuntimeException("UDP send failed to {$ip}:{$port}");
             }
             
             $response = '';
@@ -662,11 +817,11 @@ class DNSResolver {
             socket_close($socket);
             
             if ($bytes === false) {
-                throw new RuntimeException("UDP receive failed");
+                throw new RuntimeException("UDP receive failed from {$ip}:{$port}");
             }
             
             if ($from !== $ip) {
-                throw new RuntimeException("Response from unexpected source {$from} (expected {$ip})");
+                throw new RuntimeException("Response from unexpected source {$from}:{$portFrom} (expected {$ip}:{$port})");
             }
             
             return $response;
@@ -675,7 +830,7 @@ class DNSResolver {
 
     private function getCacheKey(string $domain, int $queryType, array $server): string {
         $keyData = "{$domain}:{$queryType}:{$server[0]}:{$server[1]}";
-        return md5($keyData);
+        return hash('sha256', $keyData);
     }
 
     public function resolve(
@@ -699,7 +854,11 @@ class DNSResolver {
             $results = [];
             foreach ($queryType as $qt) {
                 try {
-                    $results = array_merge($results, $this->resolve($domain, $qt, $server, $followCnames, $cnameDepth));
+                    $qtInt = is_string($qt) ? DNSRecordType::getTypeFromName($qt) : $qt;
+                    if ($qtInt === null) {
+                        throw new InvalidArgumentException("Invalid query type: {$qt}");
+                    }
+                    $results = array_merge($results, $this->resolve($domain, $qtInt, $server, $followCnames, $cnameDepth));
                 } catch (Exception $e) {
                     error_log("Failed to resolve {$qt} for {$domain}: " . $e->getMessage());
                 }
@@ -708,12 +867,11 @@ class DNSResolver {
         }
 
         if (is_string($queryType)) {
-            $queryType = strtoupper($queryType);
-            $typeConst = 'DNSRecordType::' . $queryType;
-            if (!defined($typeConst)) {
+            $queryTypeInt = DNSRecordType::getTypeFromName($queryType);
+            if ($queryTypeInt === null) {
                 throw new InvalidArgumentException("Unsupported query type: {$queryType}");
             }
-            $queryType = constant($typeConst);
+            $queryType = $queryTypeInt;
         }
 
         $servers = $server ? [$server] : $this->dnsServers;
@@ -723,7 +881,9 @@ class DNSResolver {
             $cacheKey = $this->getCacheKey($domain, $queryType, $server);
             $cached = $this->cache->get($cacheKey);
             if ($cached !== null) {
-                error_log("Cache hit for {$domain} (" . DNSRecordType::getName($queryType) . ")");
+                if ($this->debug) {
+                    error_log("Cache hit for {$domain} (" . DNSRecordType::getName($queryType) . ")");
+                }
                 return $cached;
             }
         }
@@ -736,10 +896,10 @@ class DNSResolver {
                     $serverKey = $currentServer[0] . ':' . $currentServer[1];
                     $this->queryStats[$serverKey] = ($this->queryStats[$serverKey] ?? 0) + 1;
                     
-                    [$query, $tid, $sourcePort] = $this->buildQuery($domain, $queryType, $this->requestDnssec);
+                    [$query, $tid] = $this->buildQuery($domain, $queryType, $this->requestDnssec);
                     $startTime = microtime(true);
 
-                    $data = $this->sendQuery($query, $currentServer, $sourcePort);
+                    $data = $this->sendQuery($query, $currentServer);
                     if (empty($data)) {
                         throw new RuntimeException("Empty response from DNS server");
                     }
@@ -758,8 +918,11 @@ class DNSResolver {
                         if (!empty($targetRecords)) {
                             $finalRecords = array_values($targetRecords);
                         } elseif ($followCnames && !empty($cnameRecords)) {
-                            $cnameTarget = reset($cnameRecords)->data;
-                            error_log("Following CNAME {$domain} -> {$cnameTarget}");
+                            $cnameRecord = reset($cnameRecords);
+                            $cnameTarget = $cnameRecord->data;
+                            if ($this->debug) {
+                                error_log("Following CNAME {$domain} -> {$cnameTarget}");
+                            }
                             $finalRecords = $this->resolve($cnameTarget, $queryType, 
                                 $server ?? $currentServer, true, $cnameDepth + 1);
                         } else {
@@ -769,8 +932,10 @@ class DNSResolver {
 
                     if (!empty($finalRecords)) {
                         $elapsed = (microtime(true) - $startTime) * 1000;
-                        error_log("Resolved {$domain} (" . DNSRecordType::getName($queryType) . 
-                                ") via {$currentServer[0]} in {$elapsed}ms");
+                        if ($this->debug) {
+                            error_log("Resolved {$domain} (" . DNSRecordType::getName($queryType) . 
+                                    ") via {$currentServer[0]} in {$elapsed}ms");
+                        }
                         
                         if ($cacheKey) {
                             $this->cache->put($cacheKey, $finalRecords);
@@ -780,18 +945,20 @@ class DNSResolver {
                     }
 
                 } catch (Exception $e) {
-                    $errorMsg = "{$currentServer[0]}: " . get_class($e) . ": " . $e->getMessage();
+                    $errorMsg = "{$currentServer[0]}:{$currentServer[1]} - " . get_class($e) . ": " . $e->getMessage();
                     $lastErrors[] = $errorMsg;
-                    error_log("Attempt " . ($attempt + 1) . " failed: {$errorMsg}");
+                    if ($this->debug) {
+                        error_log("Attempt " . ($attempt + 1) . " failed: {$errorMsg}");
+                    }
                     
                     if ($attempt < $this->retries - 1) {
-                        sleep(min(2 ** $attempt, 10));
+                        usleep(min(pow(2, $attempt) * 100000, 1000000));
                     }
                 }
             }
         }
 
-        throw new RuntimeException("All {$this->retries} attempts failed. Errors: " . implode(', ', $lastErrors));
+        throw new RuntimeException("All {$this->retries} attempts failed. Errors: " . implode('; ', $lastErrors));
     }
 
     public function query(
@@ -806,27 +973,24 @@ class DNSResolver {
             $records = $this->resolve($domain, $queryType, $server, $followCnames);
 
             if ($jsonOutput) {
-                if (is_array($queryType)) {
-                    $qtypeStr = array_map(fn($qt) => is_string($qt) ? $qt : DNSRecordType::getName($qt), $queryType);
-                } else {
-                    $qtypeStr = is_string($queryType) ? $queryType : DNSRecordType::getName($queryType);
-                }
-                
                 $result = [
                     'domain' => $domain,
-                    'query_type' => $qtypeStr,
-                    'records' => array_map(fn($r) => $r->toArray(), $records)
+                    'query_type' => is_string($queryType) ? $queryType : DNSRecordType::getName($queryType),
+                    'timestamp' => date('c'),
+                    'records' => array_map(fn($r) => $r->toArray(), $records),
+                    'record_count' => count($records)
                 ];
                 
-                echo json_encode($result, JSON_PRETTY_PRINT) . "\n";
+                if ($verbose) {
+                    $result['stats'] = $this->getStats();
+                    $result['cache_stats'] = $this->cache->getStats();
+                }
+                
+                echo json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
                 return;
             }
 
-            if (is_array($queryType)) {
-                $typeStr = implode(',', array_map(fn($t) => is_string($t) ? $t : DNSRecordType::getName($t), $queryType));
-            } else {
-                $typeStr = is_string($queryType) ? $queryType : DNSRecordType::getName($queryType);
-            }
+            $typeStr = is_string($queryType) ? $queryType : DNSRecordType::getName($queryType);
 
             echo "\nDNS {$typeStr} records for {$domain}:\n";
             
@@ -849,12 +1013,29 @@ class DNSResolver {
             }
             echo "\n";
         } catch (Exception $e) {
-            echo "\nError resolving {$domain}: {$e->getMessage()}\n";
+            $errorMessage = "Error resolving {$domain}: {$e->getMessage()}";
+            if ($jsonOutput) {
+                echo json_encode(['error' => $errorMessage], JSON_PRETTY_PRINT) . "\n";
+            } else {
+                echo "\n{$errorMessage}\n";
+            }
         }
     }
 
     public function getStats(): array {
-        return $this->queryStats;
+        return [
+            'query_stats' => $this->queryStats,
+            'total_queries' => array_sum($this->queryStats),
+            'cache_stats' => $this->cache->getStats(),
+            'configuration' => [
+                'timeout' => $this->timeout,
+                'retries' => $this->retries,
+                'use_tcp' => $this->useTcp,
+                'request_dnssec' => $this->requestDnssec,
+                'enable_cache' => $this->enableCache,
+                'dns_servers' => $this->dnsServers
+            ]
+        ];
     }
 
     public function clearCache(): void {
@@ -863,6 +1044,8 @@ class DNSResolver {
 }
 
 function validateServerString(string $serverStr): array {
+    $serverStr = trim($serverStr);
+    
     if (str_starts_with($serverStr, '[')) {
         $bracketEnd = strpos($serverStr, ']');
         if ($bracketEnd === false) {
@@ -871,6 +1054,14 @@ function validateServerString(string $serverStr): array {
         
         $ip = substr($serverStr, 1, $bracketEnd - 1);
         $rest = substr($serverStr, $bracketEnd + 1);
+        
+        if ($ip === '') {
+            throw new InvalidArgumentException("Empty IPv6 address");
+        }
+        
+        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            throw new InvalidArgumentException("Invalid IPv6 address: {$ip}");
+        }
         
         if (str_starts_with($rest, ':')) {
             $port = substr($rest, 1);
@@ -883,26 +1074,22 @@ function validateServerString(string $serverStr): array {
         }
     } else {
         $parts = explode(':', $serverStr);
-        if (count($parts) === 2) {
-            if (!filter_var($parts[0], FILTER_VALIDATE_IP)) {
-                throw new InvalidArgumentException("IPv6 addresses must be in brackets: {$serverStr}");
-            }
-            $ip = $parts[0];
-            $port = (int)$parts[1];
-        } elseif (count($parts) === 1) {
-            $ip = $parts[0];
-            $port = 53;
-        } else {
-            if (!filter_var($serverStr, FILTER_VALIDATE_IP)) {
-                throw new InvalidArgumentException("Invalid server format: {$serverStr}");
-            }
-            $ip = $serverStr;
-            $port = 53;
+        $count = count($parts);
+        
+        if ($count > 2) {
+            throw new InvalidArgumentException("Invalid server format: {$serverStr}");
         }
-    }
-    
-    if (!filter_var($ip, FILTER_VALIDATE_IP)) {
-        throw new InvalidArgumentException("Invalid IP address: {$ip}");
+        
+        $ip = $parts[0];
+        $port = ($count === 2) ? (int)$parts[1] : 53;
+        
+        if (str_contains($ip, ':') && !str_starts_with($ip, '[')) {
+            throw new InvalidArgumentException("IPv6 addresses must be in brackets: {$serverStr}");
+        }
+        
+        if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+            throw new InvalidArgumentException("Invalid IP address: {$ip}");
+        }
     }
     
     if ($port < 1 || $port > 65535) {
@@ -927,7 +1114,8 @@ if (PHP_SAPI === 'cli') {
         "ipv6-only",
         "ipv4-only",
         "no-cache",
-        "help"
+        "help",
+        "stats"
     ];
     
     $options = getopt($shortopts, $longopts);
@@ -943,6 +1131,7 @@ if (PHP_SAPI === 'cli') {
         echo "  -v, --verbose              Verbose output\n";
         echo "  --json                     Output in JSON format\n";
         echo "  --debug                    Enable debug logging\n";
+        echo "  --stats                    Show resolver statistics\n";
         echo "  --ipv6-only                Use only IPv6 DNS servers\n";
         echo "  --ipv4-only                Use only IPv4 DNS servers\n";
         echo "  --no-cache                 Disable response caching\n";
@@ -962,6 +1151,7 @@ if (PHP_SAPI === 'cli') {
     $ipv6Only = isset($options['ipv6-only']);
     $ipv4Only = isset($options['ipv4-only']);
     $noCache = isset($options['no-cache']);
+    $showStats = isset($options['stats']);
     
     if ($debug) {
         error_reporting(E_ALL);
@@ -974,13 +1164,33 @@ if (PHP_SAPI === 'cli') {
             $serverConfig = validateServerString($server);
         }
         
-        $queryTypes = str_contains($queryType, ',') ? explode(',', $queryType) : $queryType;
-        
         $resolver = new DNSResolver(
             useTcp: $useTcp,
             requestDnssec: $requestDnssec,
-            enableCache: !$noCache
+            enableCache: !$noCache,
+            debug: $debug
         );
+        
+        if ($showStats) {
+            $stats = $resolver->getStats();
+            if ($jsonOutput) {
+                echo json_encode($stats, JSON_PRETTY_PRINT) . "\n";
+            } else {
+                echo "\nResolver Statistics:\n";
+                echo "Total queries: " . $stats['total_queries'] . "\n";
+                echo "DNS Servers:\n";
+                foreach ($stats['configuration']['dns_servers'] as $srv) {
+                    echo "  {$srv[0]}:{$srv[1]}\n";
+                }
+                echo "\nCache Statistics:\n";
+                $cacheStats = $stats['cache_stats'];
+                echo "  Size: {$cacheStats['size']}/{$cacheStats['max_size']}\n";
+                echo "  Hits: {$cacheStats['hits']}\n";
+            }
+            exit(0);
+        }
+        
+        $queryTypes = str_contains($queryType, ',') ? explode(',', $queryType) : $queryType;
         
         $resolver->query(
             $domain,
@@ -991,7 +1201,12 @@ if (PHP_SAPI === 'cli') {
             followCnames: !$noFollowCnames
         );
     } catch (Exception $e) {
-        echo "Error: " . $e->getMessage() . "\n";
+        $errorMessage = "Error: " . $e->getMessage();
+        if ($jsonOutput) {
+            echo json_encode(['error' => $errorMessage], JSON_PRETTY_PRINT) . "\n";
+        } else {
+            echo "{$errorMessage}\n";
+        }
         exit(1);
     }
 }
