@@ -175,9 +175,11 @@ class DNSCache {
     private array $cache = [];
     private int $size = 0;
     private const MAX_RECORDS_PER_KEY = 100;
+    private int $iterationStart;
 
     public function __construct(int $maxSize = 1024) {
         $this->maxSize = $maxSize;
+        $this->iterationStart = time();
     }
 
     public function get(string $key): ?array {
@@ -848,9 +850,12 @@ class DNSResolver {
             
             return $response;
         } else {
-            $socket = @socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
+            $isIPv6 = str_contains($ip, ':');
+            $domain = $isIPv6 ? AF_INET6 : AF_INET;
+            
+            $socket = @socket_create($domain, SOCK_DGRAM, SOL_UDP);
             if (!$socket) {
-                throw new RuntimeException("UDP socket creation failed");
+                throw new RuntimeException("UDP socket creation failed for " . ($isIPv6 ? 'IPv6' : 'IPv4'));
             }
             
             if (!socket_set_option($socket, SOL_SOCKET, SO_RCVTIMEO, ['sec' => $this->timeout, 'usec' => 0])) {
@@ -859,7 +864,8 @@ class DNSResolver {
             }
             
             if ($sourcePort) {
-                if (!@socket_bind($socket, '0.0.0.0', $sourcePort)) {
+                $bindAddress = $isIPv6 ? '::' : '0.0.0.0';
+                if (!@socket_bind($socket, $bindAddress, $sourcePort)) {
                     socket_close($socket);
                     error_log("Failed to bind to source port {$sourcePort}");
                 }
@@ -926,7 +932,10 @@ class DNSResolver {
                     }
                     $results = array_merge($results, $this->resolve($domain, $qtInt, $server, $followCnames, $cnameDepth));
                 } catch (Exception $e) {
-                    error_log("Failed to resolve {$qt} for {$domain}: " . $e->getMessage());
+                    if ($this->debug) {
+                        error_log("Failed to resolve {$qt} for {$domain}: " . $e->getMessage());
+                    }
+                    throw $e;
                 }
             }
             return $results;
@@ -1034,58 +1043,27 @@ class DNSResolver {
         bool $verbose = false,
         bool $jsonOutput = false,
         bool $followCnames = true
-    ): void {
-        try {
-            $records = $this->resolve($domain, $queryType, $server, $followCnames);
-
-            if ($jsonOutput) {
-                $result = [
-                    'domain' => $domain,
-                    'query_type' => is_string($queryType) ? $queryType : DNSRecordType::getName($queryType),
-                    'timestamp' => date('c'),
-                    'records' => array_map(fn($r) => $r->toArray(), $records),
-                    'record_count' => count($records)
-                ];
-                
-                if ($verbose) {
-                    $result['stats'] = $this->getStats();
-                    $result['cache_stats'] = $this->cache->getStats();
-                }
-                
-                echo json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
-                return;
-            }
-
-            $typeStr = is_string($queryType) ? $queryType : DNSRecordType::getName($queryType);
-
-            echo "\nDNS {$typeStr} records for {$domain}:\n";
+    ): array {
+        $records = $this->resolve($domain, $queryType, $server, $followCnames);
+        
+        if ($jsonOutput) {
+            $result = [
+                'domain' => $domain,
+                'query_type' => is_string($queryType) ? $queryType : DNSRecordType::getName($queryType),
+                'timestamp' => date('c'),
+                'records' => array_map(fn($r) => $r->toArray(), $records),
+                'record_count' => count($records)
+            ];
             
-            $sections = [];
-            foreach ($records as $r) {
-                $sections[$r->section][] = $r;
+            if ($verbose) {
+                $result['stats'] = $this->getStats();
+                $result['cache_stats'] = $this->cache->getStats();
             }
             
-            foreach (['answer', 'authority', 'additional'] as $secName) {
-                if (!empty($sections[$secName])) {
-                    echo "\n;; " . ucfirst($secName) . " Section:\n";
-                    foreach ($sections[$secName] as $rec) {
-                        if ($verbose) {
-                            echo "{$rec->name}\t{$rec}\n";
-                        } else {
-                            echo "{$rec}\n";
-                        }
-                    }
-                }
-            }
-            echo "\n";
-        } catch (Exception $e) {
-            $errorMessage = "Error resolving {$domain}: {$e->getMessage()}";
-            if ($jsonOutput) {
-                echo json_encode(['error' => $errorMessage], JSON_PRETTY_PRINT) . "\n";
-            } else {
-                echo "\n{$errorMessage}\n";
-            }
+            return $result;
         }
+
+        return $records;
     }
 
     public function getStats(): array {
@@ -1206,7 +1184,22 @@ if (PHP_SAPI === 'cli') {
         exit(0);
     }
     
-    $domain = $argv[1];
+    $args = $argv;
+    array_shift($args);
+    
+    $domain = null;
+    foreach ($args as $arg) {
+        if (!str_starts_with($arg, '-')) {
+            $domain = $arg;
+            break;
+        }
+    }
+    
+    if ($domain === null) {
+        echo "Error: Domain name is required\n";
+        exit(1);
+    }
+    
     $queryType = $options['type'] ?? ($options['t'] ?? 'A');
     $server = $options['server'] ?? ($options['s'] ?? null);
     $useTcp = isset($options['tcp']);
@@ -1239,9 +1232,13 @@ if (PHP_SAPI === 'cli') {
         }
         
         $resolver = new DNSResolver(
+            dnsServers: null,
+            timeout: 3,
+            retries: 3,
             useTcp: $useTcp,
             requestDnssec: $requestDnssec,
             enableCache: !$noCache,
+            maxCacheSize: 1024,
             debug: $debug,
             ipFamily: $ipFamily
         );
@@ -1267,7 +1264,7 @@ if (PHP_SAPI === 'cli') {
         
         $queryTypes = str_contains($queryType, ',') ? explode(',', $queryType) : $queryType;
         
-        $resolver->query(
+        $result = $resolver->query(
             $domain,
             queryType: $queryTypes,
             server: $serverConfig,
@@ -1275,6 +1272,32 @@ if (PHP_SAPI === 'cli') {
             jsonOutput: $jsonOutput,
             followCnames: !$noFollowCnames
         );
+        
+        if ($jsonOutput) {
+            echo json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+        } else {
+            $typeStr = is_string($queryTypes) ? $queryTypes : DNSRecordType::getName(is_array($queryTypes) ? $queryTypes[0] : $queryTypes);
+            echo "\nDNS {$typeStr} records for {$domain}:\n";
+            
+            $sections = [];
+            foreach ($result as $r) {
+                $sections[$r->section][] = $r;
+            }
+            
+            foreach (['answer', 'authority', 'additional'] as $secName) {
+                if (!empty($sections[$secName])) {
+                    echo "\n;; " . ucfirst($secName) . " Section:\n";
+                    foreach ($sections[$secName] as $rec) {
+                        if ($verbose) {
+                            echo "{$rec->name}\t{$rec}\n";
+                        } else {
+                            echo "{$rec}\n";
+                        }
+                    }
+                }
+            }
+            echo "\n";
+        }
     } catch (Exception $e) {
         $errorMessage = "Error: " . $e->getMessage();
         if ($jsonOutput) {
