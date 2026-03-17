@@ -174,6 +174,7 @@ class DNSCache {
     private int $maxSize;
     private array $cache = [];
     private int $size = 0;
+    private const MAX_RECORDS_PER_KEY = 100;
 
     public function __construct(int $maxSize = 1024) {
         $this->maxSize = $maxSize;
@@ -227,6 +228,10 @@ class DNSCache {
         if (isset($this->cache[$key])) {
             unset($this->cache[$key]);
             $this->size--;
+        }
+
+        if (count($records) > self::MAX_RECORDS_PER_KEY) {
+            $records = array_slice($records, 0, self::MAX_RECORDS_PER_KEY);
         }
 
         $this->cache[$key] = [
@@ -303,6 +308,8 @@ class DNSResolver {
     const DEFAULT_RETRIES = 3;
     const MAX_RESPONSE_SIZE = 65535;
     const MAX_RECORDS_PER_RESPONSE = 1000;
+    const RATE_LIMIT_WINDOW = 60;
+    const MAX_QUERIES_PER_WINDOW = 100;
 
     private array $dnsServers;
     private int $timeout;
@@ -313,6 +320,8 @@ class DNSResolver {
     private DNSCache $cache;
     private array $queryStats = [];
     private bool $debug;
+    private ?string $ipFamily;
+    private array $rateLimits = [];
 
     public function __construct(
         array $dnsServers = null,
@@ -322,7 +331,8 @@ class DNSResolver {
         bool $requestDnssec = false,
         bool $enableCache = true,
         int $maxCacheSize = 1024,
-        bool $debug = false
+        bool $debug = false,
+        ?string $ipFamily = null
     ) {
         $this->dnsServers = $dnsServers ?? self::DEFAULT_DNS_SERVERS;
         $this->timeout = $timeout;
@@ -331,7 +341,20 @@ class DNSResolver {
         $this->requestDnssec = $requestDnssec;
         $this->enableCache = $enableCache;
         $this->debug = $debug;
+        $this->ipFamily = $ipFamily;
         $this->cache = new DNSCache($maxCacheSize);
+        
+        if ($ipFamily) {
+            $this->dnsServers = array_filter($this->dnsServers, function($server) use ($ipFamily) {
+                $isIPv6 = str_contains($server[0], ':');
+                return ($ipFamily === 'ipv4' && !$isIPv6) || ($ipFamily === 'ipv6' && $isIPv6);
+            });
+            
+            if (empty($this->dnsServers)) {
+                throw new InvalidArgumentException("No {$ipFamily} DNS servers available");
+            }
+        }
+        
         $this->validateDnsServers();
     }
 
@@ -356,6 +379,24 @@ class DNSResolver {
                 throw new InvalidArgumentException("Invalid port number: $port");
             }
         }
+    }
+
+    private function checkRateLimit(string $server): void {
+        $now = time();
+        if (!isset($this->rateLimits[$server])) {
+            $this->rateLimits[$server] = [];
+        }
+        
+        $this->rateLimits[$server] = array_filter(
+            $this->rateLimits[$server],
+            fn($t) => $t > $now - self::RATE_LIMIT_WINDOW
+        );
+        
+        if (count($this->rateLimits[$server]) >= self::MAX_QUERIES_PER_WINDOW) {
+            throw new RuntimeException("Rate limit exceeded for server {$server}");
+        }
+        
+        $this->rateLimits[$server][] = $now;
     }
 
     private function isValidDomain(string $domain): bool {
@@ -464,7 +505,11 @@ class DNSResolver {
                 if ($offset + 1 >= $maxLength) {
                     throw new RuntimeException("Invalid DNS pointer offset");
                 }
-                $pointer = unpack('n', substr($data, $offset, 2))[1] & 0x3FFF;
+                $pointerData = unpack('n', substr($data, $offset, 2));
+                if ($pointerData === false) {
+                    throw new RuntimeException("Failed to unpack DNS pointer");
+                }
+                $pointer = $pointerData[1] & 0x3FFF;
                 if ($pointer >= $maxLength) {
                     throw new RuntimeException("DNS pointer out of bounds");
                 }
@@ -513,7 +558,11 @@ class DNSResolver {
                     if (strlen($rdata) < 3) {
                         throw new RuntimeException("MX record too short");
                     }
-                    $preference = unpack('n', substr($rdata, 0, 2))[1];
+                    $preferenceData = unpack('n', substr($rdata, 0, 2));
+                    if ($preferenceData === false) {
+                        throw new RuntimeException("Failed to unpack MX preference");
+                    }
+                    $preference = $preferenceData[1];
                     [$exchange] = $this->parseName($packet, $rdataStart + 2);
                     return [$exchange, $preference];
                     
@@ -521,15 +570,23 @@ class DNSResolver {
                     if (strlen($rdata) < 7) {
                         throw new RuntimeException("SRV record too short");
                     }
-                    $unpacked = unpack('npriority/nweight/nport', substr($rdata, 0, 6));
-                    if ($unpacked === false) {
+                    $priorityData = unpack('n', substr($rdata, 0, 2));
+                    $weightData = unpack('n', substr($rdata, 2, 2));
+                    $portData = unpack('n', substr($rdata, 4, 2));
+                    
+                    if ($priorityData === false || $weightData === false || $portData === false) {
                         throw new RuntimeException("Failed to unpack SRV record");
                     }
+                    
+                    $priority = $priorityData[1];
+                    $weight = $weightData[1];
+                    $port = $portData[1];
+                    
                     [$target] = $this->parseName($packet, $rdataStart + 6);
                     return [
-                        'priority' => $unpacked['priority'],
-                        'weight' => $unpacked['weight'],
-                        'port' => $unpacked['port'],
+                        'priority' => $priority,
+                        'weight' => $weight,
+                        'port' => $port,
                         'target' => $target
                     ];
                     
@@ -737,6 +794,9 @@ class DNSResolver {
     private function sendQuery(string $query, array $server, ?int $sourcePort = null): string {
         $ip = $server[0];
         $port = $server[1];
+        
+        $serverKey = $ip . ':' . $port;
+        $this->checkRateLimit($serverKey);
 
         if ($this->useTcp) {
             $socket = @fsockopen("tcp://{$ip}", $port, $errno, $errstr, $this->timeout);
@@ -759,7 +819,13 @@ class DNSResolver {
                 throw new RuntimeException("Invalid TCP response header from {$ip}:{$port}");
             }
             
-            $responseLength = unpack('n', $header)[1];
+            $responseLengthData = unpack('n', $header);
+            if ($responseLengthData === false) {
+                fclose($socket);
+                throw new RuntimeException("Failed to unpack TCP response length");
+            }
+            
+            $responseLength = $responseLengthData[1];
             if ($responseLength === 0) {
                 fclose($socket);
                 throw new RuntimeException("Zero-length response from {$ip}:{$port}");
@@ -1033,6 +1099,7 @@ class DNSResolver {
                 'use_tcp' => $this->useTcp,
                 'request_dnssec' => $this->requestDnssec,
                 'enable_cache' => $this->enableCache,
+                'ip_family' => $this->ipFamily,
                 'dns_servers' => $this->dnsServers
             ]
         ];
@@ -1164,11 +1231,19 @@ if (PHP_SAPI === 'cli') {
             $serverConfig = validateServerString($server);
         }
         
+        $ipFamily = null;
+        if ($ipv6Only) {
+            $ipFamily = 'ipv6';
+        } elseif ($ipv4Only) {
+            $ipFamily = 'ipv4';
+        }
+        
         $resolver = new DNSResolver(
             useTcp: $useTcp,
             requestDnssec: $requestDnssec,
             enableCache: !$noCache,
-            debug: $debug
+            debug: $debug,
+            ipFamily: $ipFamily
         );
         
         if ($showStats) {
