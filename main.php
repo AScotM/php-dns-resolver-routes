@@ -175,11 +175,9 @@ class DNSCache {
     private array $cache = [];
     private int $size = 0;
     private const MAX_RECORDS_PER_KEY = 100;
-    private int $iterationStart;
 
     public function __construct(int $maxSize = 1024) {
         $this->maxSize = $maxSize;
-        $this->iterationStart = time();
     }
 
     public function get(string $key): ?array {
@@ -801,7 +799,9 @@ class DNSResolver {
         $this->checkRateLimit($serverKey);
 
         if ($this->useTcp) {
-            $socket = @fsockopen("tcp://{$ip}", $port, $errno, $errstr, $this->timeout);
+            $isIPv6 = str_contains($ip, ':');
+            $target = $isIPv6 ? "tcp://[{$ip}]" : "tcp://{$ip}";
+            $socket = @fsockopen($target, $port, $errno, $errstr, $this->timeout);
             if (!$socket) {
                 throw new RuntimeException("TCP connection failed to {$ip}:{$port}: {$errstr} ({$errno})");
             }
@@ -924,19 +924,24 @@ class DNSResolver {
 
         if (is_array($queryType)) {
             $results = [];
+            $errors = [];
             foreach ($queryType as $qt) {
                 try {
                     $qtInt = is_string($qt) ? DNSRecordType::getTypeFromName($qt) : $qt;
                     if ($qtInt === null) {
                         throw new InvalidArgumentException("Invalid query type: {$qt}");
                     }
-                    $results = array_merge($results, $this->resolve($domain, $qtInt, $server, $followCnames, $cnameDepth));
+                    $typeResults = $this->resolve($domain, $qtInt, $server, $followCnames, $cnameDepth);
+                    $results = array_merge($results, $typeResults);
                 } catch (Exception $e) {
+                    $errors[] = $qt . ': ' . $e->getMessage();
                     if ($this->debug) {
                         error_log("Failed to resolve {$qt} for {$domain}: " . $e->getMessage());
                     }
-                    throw $e;
                 }
+            }
+            if (empty($results) && !empty($errors)) {
+                throw new RuntimeException("All query types failed: " . implode('; ', $errors));
             }
             return $results;
         }
@@ -952,8 +957,9 @@ class DNSResolver {
         $servers = $server ? [$server] : $this->dnsServers;
         
         $cacheKey = null;
-        if ($this->enableCache && $server) {
-            $cacheKey = $this->getCacheKey($domain, $queryType, $server);
+        if ($this->enableCache) {
+            $cacheServer = $server ?? $this->dnsServers[0];
+            $cacheKey = $this->getCacheKey($domain, $queryType, $cacheServer);
             $cached = $this->cache->get($cacheKey);
             if ($cached !== null) {
                 if ($this->debug) {
@@ -1047,9 +1053,12 @@ class DNSResolver {
         $records = $this->resolve($domain, $queryType, $server, $followCnames);
         
         if ($jsonOutput) {
+            $typeDisplay = is_string($queryType) ? $queryType : 
+                (is_array($queryType) ? implode(',', array_map(fn($t) => DNSRecordType::getName($t), $queryType)) : DNSRecordType::getName($queryType));
+            
             $result = [
                 'domain' => $domain,
-                'query_type' => is_string($queryType) ? $queryType : DNSRecordType::getName($queryType),
+                'query_type' => $typeDisplay,
                 'timestamp' => date('c'),
                 'records' => array_map(fn($r) => $r->toArray(), $records),
                 'record_count' => count($records)
@@ -1184,15 +1193,32 @@ if (PHP_SAPI === 'cli') {
         exit(0);
     }
     
-    $args = $argv;
-    array_shift($args);
-    
     $domain = null;
-    foreach ($args as $arg) {
-        if (!str_starts_with($arg, '-')) {
-            $domain = $arg;
-            break;
+    $skipNext = false;
+    
+    for ($i = 1; $i < $argc; $i++) {
+        if ($skipNext) {
+            $skipNext = false;
+            continue;
         }
+        
+        $arg = $argv[$i];
+        
+        if ($arg === '--server' || $arg === '-s' || $arg === '--type' || $arg === '-t') {
+            $skipNext = true;
+            continue;
+        }
+        
+        if (str_starts_with($arg, '--')) {
+            continue;
+        }
+        
+        if (str_starts_with($arg, '-') && $arg !== '-') {
+            continue;
+        }
+        
+        $domain = $arg;
+        break;
     }
     
     if ($domain === null) {
@@ -1276,8 +1302,10 @@ if (PHP_SAPI === 'cli') {
         if ($jsonOutput) {
             echo json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
         } else {
-            $typeStr = is_string($queryTypes) ? $queryTypes : DNSRecordType::getName(is_array($queryTypes) ? $queryTypes[0] : $queryTypes);
-            echo "\nDNS {$typeStr} records for {$domain}:\n";
+            $typeDisplay = is_string($queryTypes) ? $queryTypes : 
+                (is_array($queryTypes) ? implode(',', array_map(fn($t) => DNSRecordType::getName($t), $queryTypes)) : DNSRecordType::getName($queryTypes));
+            
+            echo "\nDNS {$typeDisplay} records for {$domain}:\n";
             
             $sections = [];
             foreach ($result as $r) {
