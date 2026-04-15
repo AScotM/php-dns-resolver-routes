@@ -434,15 +434,14 @@ class DNSResolver {
             $ednsUdpSize = self::MAX_UDP_SIZE;
             $ednsFlags = 0x8000;
             
-            $optHeader = pack('n2', 0, $ednsUdpSize);
-            $optFlagsRcode = pack('nN', $ednsFlags, 0);
-            $optData = '';
-            
-            $optRData = pack('C', $ednsVersion) . $optFlagsRcode . $optData;
+            $optRData = pack('C', $ednsVersion);
+            $optRData .= pack('n', $ednsFlags);
+            $optRData .= pack('n', 0);
             $optRdLength = strlen($optRData);
             
-            $optRecord = pack('n2', 0, 41);
-            $optRecord .= pack('N', 0);
+            $optRecord = pack('n', 0);
+            $optRecord .= pack('n', 41);
+            $optRecord .= pack('n', $ednsUdpSize);
             $optRecord .= pack('n', $optRdLength);
             $optRecord .= $optRData;
             
