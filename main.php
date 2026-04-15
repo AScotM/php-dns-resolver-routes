@@ -99,7 +99,7 @@ class DNSRecord {
         }
         $elapsed = microtime(true) - $this->cacheTime;
         $remaining = $this->ttl - (int)$elapsed;
-        return max(0, $remaining);
+        return max(0, min($this->ttl, $remaining));
     }
 
     public function __toString(): string {
@@ -175,6 +175,7 @@ class DNSCache {
     private array $cache = [];
     private int $size = 0;
     private const MAX_RECORDS_PER_KEY = 100;
+    private int $serverIndex = 0;
 
     public function __construct(int $maxSize = 1024) {
         $this->maxSize = $maxSize;
@@ -198,17 +199,8 @@ class DNSCache {
             }
             $elapsed = $currentTime - $timestamp;
             if ($record->ttl > $elapsed) {
-                $remainingTTL = $record->ttl - (int)$elapsed;
-                $cachedRecord = new DNSRecord(
-                    $record->name,
-                    $record->type,
-                    $record->ttl,
-                    $record->data,
-                    $record->section,
-                    $record->preference,
-                    $record->rdata,
-                    $timestamp
-                );
+                $cachedRecord = clone $record;
+                $cachedRecord->cacheTime = $timestamp;
                 $validRecords[] = $cachedRecord;
             }
         }
@@ -322,6 +314,7 @@ class DNSResolver {
     private bool $debug;
     private ?string $ipFamily;
     private array $rateLimits = [];
+    private int $serverIndex = 0;
 
     public function __construct(
         array $dnsServers = null,
@@ -379,6 +372,12 @@ class DNSResolver {
                 throw new InvalidArgumentException("Invalid port number: $port");
             }
         }
+    }
+
+    private function getNextServer(): array {
+        $server = $this->dnsServers[$this->serverIndex % count($this->dnsServers)];
+        $this->serverIndex++;
+        return $server;
     }
 
     private function checkRateLimit(string $server): void {
@@ -457,13 +456,6 @@ class DNSResolver {
         }
 
         $question = $qname . pack('n2', $queryType, 1);
-
-        if ($dnssec) {
-            $ednsHeader = pack('n2', 41, self::MAX_UDP_SIZE);
-            $ednsFlags = 0x8000;
-            $edns = "\x00" . $ednsHeader . pack('nN', $ednsFlags, 0);
-            $question .= $edns;
-        }
 
         return [$header . $question, $tid];
     }
@@ -564,7 +556,7 @@ class DNSResolver {
                     }
                     $preference = $preferenceData[1];
                     [$exchange] = $this->parseName($packet, $rdataStart + 2);
-                    return [$exchange, $preference];
+                    return ['exchange' => $exchange, 'preference' => $preference];
                     
                 case DNSRecordType::SRV:
                     if (strlen($rdata) < 7) {
@@ -669,6 +661,11 @@ class DNSResolver {
             throw new RuntimeException("Not a DNS response");
         }
 
+        $tcBit = ($header['flags'] >> 9) & 1;
+        if ($tcBit) {
+            throw new RuntimeException("Response truncated (TC=1), retry with TCP");
+        }
+
         $totalRRs = $header['qdcount'] + $header['ancount'] + $header['nscount'] + $header['arcount'];
         if ($totalRRs > self::MAX_RECORDS_PER_RESPONSE) {
             throw new RuntimeException("Excessive RR count: {$totalRRs}");
@@ -740,14 +737,13 @@ class DNSResolver {
                     $parsedData = $this->parseRecordData($rrHeader['type'], $rdata, $data, $rdataStart);
                     
                     if ($rrHeader['type'] === DNSRecordType::MX && is_array($parsedData)) {
-                        [$exchange, $preference] = $parsedData;
                         $records[] = new DNSRecord(
                             $name,
                             $rrHeader['type'],
                             $rrHeader['ttl'],
-                            $exchange,
+                            $parsedData['exchange'],
                             $section,
-                            $preference,
+                            $parsedData['preference'],
                             $rdata
                         );
                     } elseif ($rrHeader['type'] === DNSRecordType::SRV && is_array($parsedData)) {
@@ -900,8 +896,8 @@ class DNSResolver {
         }
     }
 
-    private function getCacheKey(string $domain, int $queryType, array $server): string {
-        $keyData = "{$domain}:{$queryType}:{$server[0]}:{$server[1]}";
+    private function getCacheKey(string $domain, int $queryType): string {
+        $keyData = "{$domain}:{$queryType}";
         return hash('sha256', $keyData);
     }
 
@@ -958,8 +954,7 @@ class DNSResolver {
         
         $cacheKey = null;
         if ($this->enableCache) {
-            $cacheServer = $server ?? $this->dnsServers[0];
-            $cacheKey = $this->getCacheKey($domain, $queryType, $cacheServer);
+            $cacheKey = $this->getCacheKey($domain, $queryType);
             $cached = $this->cache->get($cacheKey);
             if ($cached !== null) {
                 if ($this->debug) {
@@ -972,7 +967,8 @@ class DNSResolver {
         $lastErrors = [];
 
         for ($attempt = 0; $attempt < $this->retries; $attempt++) {
-            foreach ($servers as $currentServer) {
+            $serverList = $server ? $servers : $this->dnsServers;
+            foreach ($serverList as $currentServer) {
                 try {
                     $serverKey = $currentServer[0] . ':' . $currentServer[1];
                     $this->queryStats[$serverKey] = ($this->queryStats[$serverKey] ?? 0) + 1;
@@ -993,8 +989,18 @@ class DNSResolver {
                     if ($queryType === DNSRecordType::ANY) {
                         $finalRecords = $records;
                     } else {
-                        $targetRecords = array_filter($records, fn($r) => $r->type === $queryType && $r->section === 'answer');
-                        $cnameRecords = array_filter($records, fn($r) => $r->type === DNSRecordType::CNAME && $r->section === 'answer');
+                        $targetRecords = [];
+                        $cnameRecords = [];
+                        
+                        foreach ($records as $r) {
+                            if ($r->section === 'answer') {
+                                if ($r->type === $queryType) {
+                                    $targetRecords[] = $r;
+                                } elseif ($r->type === DNSRecordType::CNAME) {
+                                    $cnameRecords[] = $r;
+                                }
+                            }
+                        }
                         
                         if (!empty($targetRecords)) {
                             $finalRecords = array_values($targetRecords);
