@@ -425,26 +425,24 @@ class DNSResolver {
 
         $tid = random_int(0, 65535);
         $flags = 0x0100;
-        
+
         $additionalCount = 0;
         $additionalSection = '';
-        
+
         if ($this->requestDnssec) {
-            $ednsVersion = 0;
             $ednsUdpSize = self::MAX_UDP_SIZE;
+            $extRcode = 0;
+            $ednsVersion = 0;
             $ednsFlags = 0x8000;
-            
-            $optRData = pack('C', $ednsVersion);
-            $optRData .= pack('n', $ednsFlags);
-            $optRData .= pack('n', 0);
-            $optRdLength = strlen($optRData);
-            
-            $optRecord = pack('n', 0);
+
+            $optRecord = "\x00";
             $optRecord .= pack('n', 41);
             $optRecord .= pack('n', $ednsUdpSize);
-            $optRecord .= pack('n', $optRdLength);
-            $optRecord .= $optRData;
-            
+            $optRecord .= pack('C', $extRcode);
+            $optRecord .= pack('C', $ednsVersion);
+            $optRecord .= pack('n', $ednsFlags);
+            $optRecord .= pack('n', 0);
+
             $additionalSection = $optRecord;
             $additionalCount = 1;
         }
@@ -463,10 +461,8 @@ class DNSResolver {
         }
 
         $question = $qname . pack('n2', $queryType, 1);
-        
-        $fullQuery = $header . $question . $additionalSection;
 
-        return [$fullQuery, $tid];
+        return [$header . $question . $additionalSection, $tid];
     }
 
     private function parseName(string $data, int $offset, array &$seenPointers = []): array {
