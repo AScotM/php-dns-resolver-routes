@@ -301,6 +301,7 @@ class DNSResolver {
     const MAX_RECORDS_PER_RESPONSE = 1000;
     const RATE_LIMIT_WINDOW = 60;
     const MAX_QUERIES_PER_WINDOW = 100;
+    const TYPE_OPT = 41;
 
     private array $dnsServers;
     private int $timeout;
@@ -325,6 +326,19 @@ class DNSResolver {
         bool $debug = false,
         ?string $ipFamily = null
     ) {
+        if ($timeout < 1) {
+            throw new InvalidArgumentException("Timeout must be at least 1 second");
+        }
+        if ($retries < 1) {
+            throw new InvalidArgumentException("Retries must be at least 1");
+        }
+        if ($maxCacheSize < 1) {
+            throw new InvalidArgumentException("Cache size must be at least 1");
+        }
+        if ($ipFamily !== null && !in_array($ipFamily, ['ipv4', 'ipv6'], true)) {
+            throw new InvalidArgumentException("IP family must be ipv4 or ipv6");
+        }
+
         $this->dnsServers = $dnsServers ?? self::DEFAULT_DNS_SERVERS;
         $this->timeout = $timeout;
         $this->retries = $retries;
@@ -807,7 +821,11 @@ class DNSResolver {
                 $rdata = substr($data, $rdataStart, $rrHeader['rdlength']);
                 $offset += $rrHeader['rdlength'];
 
-                if ($rrHeader['type'] === 41) {
+                if ($rrHeader['type'] === self::TYPE_OPT) {
+                    $extendedRcode = ($rrHeader['ttl'] >> 24) & 0xFF;
+                    if ($extendedRcode !== 0) {
+                        throw new RuntimeException("DNS extended error code: " . (($extendedRcode << 4) | $rcode));
+                    }
                     continue;
                 }
 
@@ -1192,13 +1210,14 @@ class DNSResolver {
                                     );
                                 }
 
-                                $finalRecords = $this->resolve(
+                                $resolvedTarget = $this->resolve(
                                     $cnameTarget,
                                     $queryType,
                                     $server ?? $currentServer,
                                     true,
                                     $cnameDepth + 1
                                 );
+                                $finalRecords = array_merge($cnameRecords, $resolvedTarget);
                             }
                         }
 
@@ -1484,7 +1503,7 @@ function printUsage(): void {
     echo "  -t, --type <type>          DNS record type or comma-separated list\n";
     echo "  -s, --server <ip:port>     Specific DNS server\n";
     echo "  --tcp                      Use TCP instead of UDP\n";
-    echo "  --request-dnssec, --dnssec Request DNSSEC records\n";
+    echo "  --request-dnssec, --dnssec Request DNSSEC records via EDNS DO bit\n";
     echo "  --no-follow-cnames         Disable following CNAME records\n";
     echo "  -v, --verbose              Verbose output\n";
     echo "  --json                     Output in JSON format\n";
@@ -1527,6 +1546,11 @@ if (PHP_SAPI === 'cli') {
     $noCache = isset($options['no-cache']);
     $showStats = isset($options['stats']);
     
+    if ($ipv6Only && $ipv4Only) {
+        fwrite(STDERR, "Error: --ipv4-only and --ipv6-only cannot be used together\n");
+        exit(1);
+    }
+
     if ($debug) {
         error_reporting(E_ALL);
         ini_set('display_errors', 1);
@@ -1556,25 +1580,6 @@ if (PHP_SAPI === 'cli') {
             debug: $debug,
             ipFamily: $ipFamily
         );
-        
-        if ($showStats) {
-            $stats = $resolver->getStats();
-            if ($jsonOutput) {
-                echo json_encode($stats, JSON_PRETTY_PRINT) . "\n";
-            } else {
-                echo "\nResolver Statistics:\n";
-                echo "Total queries: " . $stats['total_queries'] . "\n";
-                echo "DNS Servers:\n";
-                foreach ($stats['configuration']['dns_servers'] as $srv) {
-                    echo "  {$srv[0]}:{$srv[1]}\n";
-                }
-                echo "\nCache Statistics:\n";
-                $cacheStats = $stats['cache_stats'];
-                echo "  Size: {$cacheStats['size']}/{$cacheStats['max_size']}\n";
-                echo "  Hits: {$cacheStats['hits']}\n";
-            }
-            exit(0);
-        }
         
         $queryTypes = str_contains($queryType, ',') ? array_map('trim', explode(',', $queryType)) : trim($queryType);
         
@@ -1625,6 +1630,20 @@ if (PHP_SAPI === 'cli') {
                 }
             }
             echo "\n";
+        }
+
+        if ($showStats) {
+            $stats = $resolver->getStats();
+            if ($jsonOutput) {
+                fwrite(STDERR, json_encode(['stats' => $stats], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
+            } else {
+                echo "Resolver Statistics:\n";
+                echo "Total queries: " . $stats['total_queries'] . "\n";
+                echo "Cache: " . $stats['cache_stats']['size'] . "/" . $stats['cache_stats']['max_size'] . "\n";
+                echo "Cache hits: " . $stats['cache_stats']['hits'] . "\n";
+                echo "DNSSEC requested: " . ($stats['configuration']['request_dnssec'] ? 'yes' : 'no') . "\n";
+                echo "DNSSEC validation: no\n";
+            }
         }
     } catch (Exception $e) {
         $errorMessage = "Error: " . $e->getMessage();
